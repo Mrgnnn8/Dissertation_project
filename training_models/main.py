@@ -1,0 +1,298 @@
+import argparse
+import torch
+from model import resnet18, efficientnet_b0
+from model_zoo import ModelZoo
+from data import load_cifar100, load_mnist, load_imagenet, load_cityscapes, load_cifar10, load_medmnist3D, load_noisy
+from data import load_cifar100, load_mnist, load_imagenet, load_cityscapes, load_cifar10, load_medmnist3D, load_cub2011, load_aircraft, load_flowers
+from baseline import train_baseline, train_baseline_noisy
+from selective_gradient import TrainRevision
+from test import test_model
+from longtail_train import train_baseline_longtail, train_with_revision_longtail
+from learning_cycles import set_seed, make_run_id
+from dbpd_mechanisms import train_critical_periods_dbpd, train_delayed_dbpd, train_soft_dbpd, train_combined
+
+def main():
+    parser = argparse.ArgumentParser(description="Train ResNet on CIFAR-100")
+    parser.add_argument("--mode", type=str, choices=["baseline", "selective_gradient", "selective_epoch", "train_with_revision", "train_with_samples", "train_with_revision_3d", "train_with_random", "train_with_inv_lin", "train_with_log", "train_with_percentage",
+                                                     "train_with_adaptive", "train_with_alternative", "critical_periods_dbpd", "soft_dbpd", "delayed_dbpd", "combined"], required=True,
+                        help="Choose training mode: 'baseline' or 'selective_gradient'")
+    parser.add_argument("--epoch", type=int, required=False, default=10,
+                        help="Number of epochs to train for")
+    parser.add_argument("--task", type=str, required=True, default="classification",
+                        help="segmentation or classification or longtail")
+    parser.add_argument("--model", type=str, choices=["resnet18", "resnet_3d", "resnet34", "resnet50", "resnet101", "efficientnet_b0","efficientnet_b7", "efficientnet_b4", "mobilenet_v2", "mobilenet_v3", "vit_b_16", "mae_vit_b_16", "efficientformer", "segformer_b2"], required=True,
+                        help="Choose the model: 'resnet18', 'resnet34', 'resnet50', 'resnet101', 'mobilenet_v2', 'mobilenet_v3', 'efficientnet_b0', 'vit_b_16', 'mae_vit_b_16'")
+    parser.add_argument("--pretrained", action="store_true", help="Use pretrained versions (applies to torchvision models, not MAE)")
+    parser.add_argument("--mae_checkpoint", type=str, default=None, help="Path to MAE pretrained checkpoint file (used with --model mae_vit_b_16)")
+    parser.add_argument("--save_path", type=str, help="to save graphs")
+    parser.add_argument("--threshold", type=float, help="threshold to remove samples")
+    parser.add_argument("--epoch_threshold", type=int, help="threshold to reintroduce correct samples in epoch")
+    parser.add_argument("--dataset", type=str, help="CIFAR or MNIST")
+    parser.add_argument("--batch_size", type=int, help="32,64,128 etc.")
+    parser.add_argument("--start_revision", type=int, help="Start revision after the given epoch")
+    parser.add_argument("--long_tail", action="store_true", help="LongTail CIFAR100 or native version")
+    parser.add_argument("--ldam", action="store_true", help="Use LDAM-DRW method for long tail classification")
+    parser.add_argument("--noisy", action="store_true", help="Use noisy dataset")
+    parser.add_argument("--interval", type=int, default=50)
+    parser.add_argument("--increment", type=float, default=0.1)
+    parser.add_argument("--download", action="store_true", help="Download dataset if not exists (for aircraft and cub2011 datasets)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--critical_window", type=int, default=15, help="[critical_periods_dbpd] Max epochs for Phase 1 (augmented, critical period) before forcing the switch to Phase 2")
+    parser.add_argument("--gc_check_interval", type=int, default=5, help="[critical_periods_dbpd] Check for critical-period end every N epochs")
+    parser.add_argument("--gc_num_batches", type=int, default=10, help="[critical_periods_dbpd] Number of sampled batches used to probe the Gradient Confusion metric")
+    parser.add_argument("--gc_metric_frequency", type=int, default=1, help="[critical_periods_dbpd] Compute the Gradient Confusion metric every N epochs")
+    parser.add_argument("--gc_outlier_threshold", type=float, default=1.5, help="[critical_periods_dbpd] IQR multiplier for detecting a low-outlier drop in Gradient Confusion")
+    parser.add_argument("--final_revision_epochs", type=int, default=1, help="[critical_periods_dbpd, soft_dbpd, delayed_dbpd, combined] Number of epochs at the end of the total epoch budget that train on the full, unfiltered dataset (mirrors train_with_revision's post-start_revision epochs)")
+    parser.add_argument("--keep_rate", type=float, default=0.1, help="[soft_dbpd, combined] Fraction of 'easy' (>= threshold) samples retained each batch, upweighted by 1/keep_rate")
+    parser.add_argument("--onset", type=int, default=None, help="[delayed_dbpd, combined] Epoch at which to switch from full-dataset training to DBPD filtering (no default - required for these modes)")
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pretrained = False
+    if args.dataset == "mnist":
+        num_classes = 10
+        if args.batch_size:
+            train_loader, test_loader, data_size = load_mnist(args.batch_size)
+        else:
+            train_loader, test_loader, data_size = load_mnist()
+    elif args.dataset == "cifar":
+        if args.batch_size:
+            train_loader, test_loader, cls_num_list, data_size = load_cifar100(args.long_tail, args.batch_size)
+        else:
+            train_loader, test_loader, cls_num_list, data_size = load_cifar100(args.long_tail)
+
+        num_classes = 100
+    elif args.dataset == "cifar10":
+        if args.noisy:
+            train_loader, test_loader, data_size = load_noisy(args.batch_size)
+        else:
+            train_loader, test_loader, cls_num_list, data_size = load_cifar10(args.long_tail, args.batch_size)
+        num_classes = 10
+    elif args.dataset == "imagenet":
+        num_classes = 1000
+        train_loader, test_loader, data_size = load_imagenet(args.batch_size)
+    elif args.dataset == "cityscapes":
+        num_classes = 19
+        train_loader, test_loader = load_cityscapes()
+    elif args.dataset == "organ_medmnist3d":
+        num_classes = 11
+        train_loader, test_loader, data_size = load_medmnist3D(args.batch_size)
+    
+    if not args.long_tail:
+        cls_num_list = None
+    elif args.dataset == "aircraft":
+        num_classes = 100  # FGVC-Aircraft variant 有 100 个类别
+        if args.batch_size:
+            train_loader, test_loader, data_size = load_aircraft(args.batch_size, root='/root/autodl-tmp/project/training_models/dataset', download=args.download)
+        else:
+            train_loader, test_loader, data_size = load_aircraft(download=args.download)
+    elif args.dataset == "cub2011":
+        num_classes = 200  # CUB-200-2011 有 200 个类别
+        if args.batch_size:
+            train_loader, test_loader, data_size = load_cub2011(args.batch_size, root='/root/autodl-tmp/project/training_models/dataset', download=args.download)
+        else:
+            train_loader, test_loader, data_size = load_cub2011(root='/root/autodl-tmp/project/training_models/dataset', download=args.download)
+    elif args.dataset == "flowers":
+        num_classes = 102  # Oxford 102 Category Flower 有 102 个类别
+        if args.batch_size:
+            train_loader, val_loader, test_loader, data_size = load_flowers(args.batch_size, root='/root/autodl-tmp/project/training_models/dataset', download=args.download)
+        else:
+            train_loader, val_loader, test_loader, data_size = load_flowers(root='/root/autodl-tmp/project/training_models/dataset', download=args.download)
+
+
+    if args.pretrained:
+        pretrained = True
+    
+    if args.task == "classification" or args.task=="longtail":
+        mz = ModelZoo(num_classes, pretrained)
+    elif args.task == "segmentation":
+        mz = ModelZoo(num_classes, pretrained)
+
+    ###Models From Scratch###
+    if args.model == "resnet18":
+        # model = resnet18(num_classes=100)
+        model = mz.resnet18()
+    elif args.model == "efficientnet_b0":
+        # model = efficientnet_b0(num_classes=100)
+        model = mz.efficientnet_b0()
+
+    ###PyTorch Models###
+    elif args.model == "mobilenet_v2":
+        model = mz.mobilenet_v2()
+    elif args.model == "mobilenet_v3":
+        model = mz.mobilenet_v3()
+    elif args.model == "resnet34":
+        model = mz.resnet34()
+    elif args.model == "resnet50":
+        model = mz.resnet50()
+    elif args.model == "resnet101":
+        model = mz.resnet101()
+    elif args.model == "vit_b_16":
+        model = mz.vit_b_16()
+    elif args.model == "mae_vit_b_16":
+        if not args.mae_checkpoint:
+            parser.error("--mae_checkpoint is required when using --model mae_vit_b_16")
+        # The 'pretrained' flag for ModelZoo is not directly used by mae_vit_b_16,
+        # as it loads weights from the checkpoint_path.
+        # However, ModelZoo still needs to be initialized.
+        # We can pass False for pretrained here, or adjust ModelZoo if needed.
+        # For simplicity, let's assume ModelZoo's pretrained flag is for its other models.
+        model = mz.mae_vit_b_16(checkpoint_path=args.mae_checkpoint)
+    elif args.model == "efficientformer":
+        model = mz.efficientformer()
+    elif args.model == "efficientnet_b7":
+        model = mz.efficientnet_b7()
+    elif args.model == "efficientnet_b4":
+        model = mz.efficientnet_b4()
+    elif args.model == "segformer_b2":
+        # model = mz.segformer_b2()
+        # model = mz.mmseg_model()
+        # model = mz.lraspp_mobilenet_v3_large()
+        model = mz.segformer()
+    elif args.model == "resnet_3d":
+        model = mz.resnet18_3d()
+
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    if args.pretrained:
+        args.model = args.model + "_" + "pretrained" + "_" + str(args.threshold)
+    else:
+        args.model = args.model + "_" + str(args.threshold)
+
+    if args.mode == "baseline":
+        args.model = args.model + "_" + "baseline"
+
+    run_id = make_run_id(args.model)
+
+    if args.long_tail and args.ldam:
+        if args.mode == "baseline":
+            trained_model = train_baseline_longtail(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, cls_num_list)
+        elif args.mode == "train_with_revision":
+            trained_model = train_with_revision_longtail(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold, args.start_revision, args.task, cls_num_list)
+
+    else: 
+        if args.mode == "baseline":
+            print("Training in baseline mode...")
+            if args.noisy:
+                trained_model = train_baseline_noisy(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.task, cls_num_list)
+            else:
+                trained_model = train_baseline(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.task, cls_num_list, run_id=run_id, seed=args.seed, dataset_name=args.dataset)
+        elif args.mode == "selective_gradient":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print("Training with selective gradient updates...")
+            trained_model = train_revision.train_selective()
+        elif args.mode == "selective_epoch":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Reintroducing correct examples and training...")
+            trained_model = train_revision.train_selective_epoch()
+        elif args.mode == "train_with_revision":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold, run_id=run_id, seed=args.seed, dataset=args.dataset)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            if args.noisy:
+                trained_model, num_step = train_revision.train_with_noisy_revision(args.start_revision, args.task, cls_num_list)
+            else:
+                trained_model, num_step = train_revision.train_with_revision(args.start_revision, args.task, cls_num_list)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_random":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            if args.noisy:
+                trained_model, num_step = train_revision.train_with_noisy_random(args.start_revision, args.task)
+            else:
+                trained_model, num_step = train_revision.train_with_random(args.start_revision, args.task)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_revision_3d":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            trained_model, num_step = train_revision.train_with_revision_3d(args.start_revision, args.task)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_percentage":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            if args.noisy:
+                trained_model, num_step = train_revision.train_with_noisy_percentage(args.start_revision)
+            else:
+                trained_model, num_step = train_revision.train_with_percentage(args.start_revision)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_inv_lin":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            trained_model, num_step = train_revision.train_with_inverse_linear(args.start_revision, data_size)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_log":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            trained_model, num_step = train_revision.train_with_log(args.start_revision, data_size)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_adaptive":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            trained_model, num_step = train_revision.train_with_adaptive(args.start_revision, args.task, cls_num_list, args.interval, args.increment)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_alternative":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            trained_model, num_step = train_revision.train_with_alternative(args.start_revision, args.task, cls_num_list)
+            print("Number of steps : ", num_step)
+        elif args.mode == "critical_periods_dbpd":
+            print(f"Training {args.mode}: Phase 1 (critical period, augmented) up to {args.critical_window} epochs, then Phase 2 (DBPD, threshold {args.threshold})")
+            trained_model, num_step = train_critical_periods_dbpd(
+                args.model, model, train_loader, test_loader, device, args.epoch, args.save_path,
+                args.threshold, args.task, cls_num_list,
+                critical_window=args.critical_window, gc_check_interval=args.gc_check_interval,
+                gc_num_batches=args.gc_num_batches, gc_metric_frequency=args.gc_metric_frequency,
+                gc_outlier_threshold=args.gc_outlier_threshold, final_revision_epochs=args.final_revision_epochs,
+                run_id=run_id, seed=args.seed, dataset_name=args.dataset,
+            )
+            print("Number of steps : ", num_step)
+        elif args.mode == "soft_dbpd":
+            print(f"Training {args.mode}: bias-corrected DBPD, threshold {args.threshold}, keep_rate {args.keep_rate}")
+            trained_model, num_step = train_soft_dbpd(
+                args.model, model, train_loader, test_loader, device, args.epoch, args.save_path,
+                args.threshold, args.task, cls_num_list,
+                keep_rate=args.keep_rate, final_revision_epochs=args.final_revision_epochs,
+                run_id=run_id, seed=args.seed, dataset_name=args.dataset,
+            )
+            print("Number of steps : ", num_step)
+        elif args.mode == "delayed_dbpd":
+            if args.onset is None:
+                parser.error("--onset is required when using --mode delayed_dbpd")
+            print(f"Training {args.mode}: full-dataset training until epoch {args.onset}, then DBPD (threshold {args.threshold})")
+            trained_model, num_step = train_delayed_dbpd(
+                args.model, model, train_loader, test_loader, device, args.epoch, args.save_path,
+                args.threshold, args.task, cls_num_list, args.onset,
+                final_revision_epochs=args.final_revision_epochs,
+                run_id=run_id, seed=args.seed, dataset_name=args.dataset,
+            )
+            print("Number of steps : ", num_step)
+        elif args.mode == "combined":
+            if args.onset is None:
+                parser.error("--onset is required when using --mode combined")
+            print(f"Training {args.mode}: full-dataset training until epoch {args.onset}, then soft-DBPD "
+                  f"(threshold {args.threshold}, keep_rate {args.keep_rate})")
+            trained_model, num_step = train_combined(
+                args.model, model, train_loader, test_loader, device, args.epoch, args.save_path,
+                args.threshold, args.task, cls_num_list, args.onset,
+                keep_rate=args.keep_rate, final_revision_epochs=args.final_revision_epochs,
+                run_id=run_id, seed=args.seed, dataset_name=args.dataset,
+            )
+            print("Number of steps : ", num_step)
+
+    if args.mode == "baseline":
+        num_step = data_size
+    eff_epoch = int(num_step/data_size)
+
+    print("Effective Epochs: ", eff_epoch)
+    # 只有在某些训练模式下才计算有效epoch
+    if 'num_step' in locals():
+        eff_epoch = int(num_step/data_size)
+        print("Effective Epochs: ", eff_epoch)
+    else:
+        print("Training completed in baseline mode")
+    torch.save(trained_model, "trained_model.pth")
+    
+if __name__ == "__main__":
+    main()
