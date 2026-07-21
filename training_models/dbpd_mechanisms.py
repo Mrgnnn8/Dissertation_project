@@ -582,14 +582,75 @@ def train_soft_dbpd(model_name, model, train_loader, test_loader, device, epochs
 
     Per the spec: "loss must be computed with reduction='none', multiplied
     by a per-sample weight vector, then meaned" - done here by meaning over
-    the kept (hard + retained-easy) subset only, matching InfoBatch's own
-    rescaled-mean formulation. Sampling here is per-batch rather than a
-    single pass over the whole epoch's easy set upfront, since every other
-    training loop in this codebase (train_with_revision, the Phase 2 above)
-    is online/per-batch; since batches are drawn via shuffle=True, retaining
-    a `keep_rate` fraction of each batch's easy set is statistically
-    equivalent in expectation to retaining that fraction of the full
-    epoch's easy set.
+    the kept (hard + retained-easy) subset only (`.mean()` over the
+    already-filtered `inputs_kept`/`weights_kept`, matching train_combined),
+    NOT divided by the pre-filter batch size - dividing by the pre-filter
+    size would silently shrink the loss by kept_count/batch_size, which
+    algebraically cancels most of the 1/keep_rate upweighting once the hard
+    pool is small, defeating the whole point of the rescaling. Sampling here
+    is per-batch rather than a single pass over the whole epoch's easy set
+    upfront, since every other training loop in this codebase
+    (train_with_revision, the Phase 2 above) is online/per-batch; since
+    batches are drawn via shuffle=True, retaining a `keep_rate` fraction of
+    each batch's easy set is statistically equivalent in expectation to
+    retaining that fraction of the full epoch's easy set.
+
+    Easy-pool gate: vanilla DBPD naturally goes quiet once its hard pool
+    empties out (a batch with <2 hard samples is skipped entirely - see
+    `will_train` below), so late in training DBPD is mostly coasting rather
+    than still applying its selection mechanism. Left unchecked, soft_dbpd
+    has no equivalent - it always retains a random keep_rate slice of
+    whatever's "easy" regardless of how large or small the hard pool is, so
+    it keeps making real gradient updates on a fresh random half of
+    already-memorized data long after DBPD would've stopped, which both
+    wastes the compute savings the DBPD family is supposed to deliver and
+    confounds any comparison between the two methods. This reuses DBPD's own
+    literal condition - the same `hard_mask` size check that already decides
+    `will_train` - as the gate for whether easy-pool retention happens at
+    all: if the hard mask has fewer than 2 samples this batch, no easy
+    samples are retained either (the batch then falls through to the
+    existing `will_train` check and is skipped entirely, exactly as it would
+    be under plain DBPD). This is deliberately a per-batch, stateless check
+    (no rolling history, no statistical test, no checkpoint state) rather
+    than a one-way "exhausted" switch - it reuses a hard ground-truth count
+    that's already computed every batch, so it can't drift or need tuning
+    the way a derived signal (e.g. the easy pool's own mean loss, which
+    turned out to be noisy - newly-easy samples enter with much higher loss
+    than long-easy ones, so the pool's mean isn't monotone) would.
+
+    Easy-pool decay: the gate above only catches a batch that's *already*
+    almost entirely out of hard samples - it does nothing while the hard
+    pool is shrinking but still present, which is most of a run. Over that
+    stretch, easy_pool_size grows toward the whole dataset while keep_rate
+    stays fixed, so retained-easy count grows too, even though DBPD's own
+    hard-only training is simultaneously *shrinking*. To track DBPD's
+    schedule instead of working against it, the retention probability is
+    scaled by hard_fraction = hard_count_(this epoch) / hard_count_epoch0 -
+    epoch 0's hard count (near the whole dataset, before the model has
+    learned anything) is the fixed reference point, and each later epoch's
+    fraction is measured against it. One epoch's lag is unavoidable (this
+    epoch's total hard count isn't known until its batches are done), so
+    epoch t uses epoch (t-1)'s measured fraction; epoch 0 itself has no
+    prior epoch and bootstraps at hard_fraction=1.0, which is also just
+    correct by construction (it's the reference point). The combined
+    per-sample retention probability is `keep_rate * hard_fraction` - a
+    single Bernoulli draw at the product rate, not two sequential ones,
+    since composing two independent random subsamples is the same
+    distribution as one draw at the product probability. The `1/keep_rate`
+    reweighting is deliberately left unchanged (not rescaled to
+    1/(keep_rate*hard_fraction)): this makes the easy group's estimate
+    target a population that shrinks in lockstep with the hard pool, rather
+    than staying unbiased relative to the ever-growing full easy set forever
+    - a designed-in, quantifiable bias in exchange for tracking DBPD's own
+    compute schedule instead of ballooning past it. Deliberately NOT
+    implemented as a cascading "only resample from what was retained last
+    time" scheme: that would let already-decided samples drop out of
+    consideration permanently based on nothing but accumulated luck (a
+    founder effect), losing exactly the "representative coverage" the paper
+    credits for random dropout's own success. Each epoch draws fresh from
+    the current easy pool, just at a decaying rate - no sample is ever
+    permanently excluded, only ever less likely to be drawn as training
+    progresses.
     """
     model.to(device)
     criterion = nn.CrossEntropyLoss()
@@ -610,9 +671,17 @@ def train_soft_dbpd(model_name, model, train_loader, test_loader, device, epochs
     samples_used_per_epoch = []
     num_step = 0
     pending_recorder_state = None
+    hard_count_epoch0 = None
+    hard_count_prev_epoch = None
 
     if os.path.exists(ckpt_path):
-        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        # Loaded to CPU regardless of training device: map_location=device
+        # would drag every tensor in the checkpoint onto the GPU during
+        # deserialization, including the RNG state, which torch.set_rng_state
+        # then rejects (it requires a CPU ByteTensor). model/optimizer
+        # .load_state_dict() below already move their tensors onto the
+        # right device themselves, so this is the standard/safe pattern.
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -625,6 +694,8 @@ def train_soft_dbpd(model_name, model, train_loader, test_loader, device, epochs
         time_per_epoch = checkpoint["time_per_epoch"]
         samples_used_per_epoch = checkpoint["samples_used_per_epoch"]
         num_step = checkpoint["num_step"]
+        hard_count_epoch0 = checkpoint["hard_count_epoch0"]
+        hard_count_prev_epoch = checkpoint["hard_count_prev_epoch"]
         torch.set_rng_state(checkpoint["torch_rng_state"])
         if torch.cuda.is_available() and checkpoint.get("cuda_rng_state") is not None:
             torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
@@ -655,6 +726,13 @@ def train_soft_dbpd(model_name, model, train_loader, test_loader, device, epochs
         model.train()
         epoch_start_time = time.time()
         running_loss, total_correct, total_samples = 0.0, 0, 0
+        hard_count_this_epoch = 0
+        # One-epoch lag: this epoch's own hard count isn't known until its
+        # batches are done, so this epoch uses last epoch's measured
+        # fraction. No prior epoch yet (hard_count_epoch0 unset) bootstraps
+        # at 1.0, which is also correct by construction - epoch 0 is the
+        # reference point itself.
+        hard_fraction = 1.0 if hard_count_epoch0 is None else (hard_count_prev_epoch / hard_count_epoch0)
 
         phase_label = "revision" if is_revision_epoch else "soft_dbpd"
         progress_bar = tqdm(enumerate(indexed_train_loader), total=len(indexed_train_loader),
@@ -676,7 +754,20 @@ def train_soft_dbpd(model_name, model, train_loader, test_loader, device, epochs
                 else:
                     hard_mask = (preds != labels) if threshold == 0 else (correct_class < threshold)
                     easy_mask = ~hard_mask
-                    retained_easy_mask = easy_mask & (torch.rand_like(correct_class) < keep_rate)
+                    hard_count_this_epoch += hard_mask.sum().item()
+                    if hard_mask.sum() < 2:
+                        # DBPD's own gate: too few hard samples this batch
+                        # for DBPD to have trained on it at all - don't let
+                        # soft_dbpd sneak in easy-pool retention DBPD
+                        # wouldn't be doing either. Falls through to
+                        # will_train below, which will now also skip.
+                        retained_easy_mask = torch.zeros_like(easy_mask)
+                    else:
+                        # Decayed retention rate: one Bernoulli draw at the
+                        # product probability, equivalent to first shrinking
+                        # the candidate pool by hard_fraction and then
+                        # applying keep_rate to what's left.
+                        retained_easy_mask = easy_mask & (torch.rand_like(correct_class) < keep_rate * hard_fraction)
                     mask = hard_mask | retained_easy_mask
                     weights[retained_easy_mask] = 1.0 / keep_rate
 
@@ -699,8 +790,6 @@ def train_soft_dbpd(model_name, model, train_loader, test_loader, device, epochs
             if not will_train:
                 continue
 
-            original_batch_size = labels.size(0)       
-
             inputs_kept = inputs[mask]
             labels_kept = labels[mask]
             weights_kept = weights[mask]
@@ -708,7 +797,7 @@ def train_soft_dbpd(model_name, model, train_loader, test_loader, device, epochs
             optimizer.zero_grad()
             outputs_kept = model(inputs_kept)
             per_sample = per_sample_loss(outputs_kept, labels_kept)
-            loss = (per_sample * weights_kept).sum() / original_batch_size
+            loss = (per_sample * weights_kept).mean()
             loss.backward()
             optimizer.step()
 
@@ -734,12 +823,17 @@ def train_soft_dbpd(model_name, model, train_loader, test_loader, device, epochs
         epoch_test_losses.append(val_loss)
         samples_used_per_epoch.append(samples_used)
 
+        if not is_revision_epoch:
+            if hard_count_epoch0 is None:
+                hard_count_epoch0 = hard_count_this_epoch
+            hard_count_prev_epoch = hard_count_this_epoch
+
         recorder.log_epoch(
             epoch=epoch, learning_rate=current_lr, threshold=threshold, phase=phase_label,
             train_loss=epoch_loss, train_accuracy=epoch_accuracy,
             val_loss=val_loss, val_accuracy=accuracy,
             samples_used=samples_used, samples_total=total_samples,
-            time_seconds=time_per_epoch[-1],
+            time_seconds=time_per_epoch[-1], hard_fraction=None if is_revision_epoch else hard_fraction,
         )
         # This epoch's samples file is finalized (footer written, readable)
         # before the checkpoint is saved, so a crash on the very next line
@@ -759,6 +853,8 @@ def train_soft_dbpd(model_name, model, train_loader, test_loader, device, epochs
             "time_per_epoch": time_per_epoch,
             "samples_used_per_epoch": samples_used_per_epoch,
             "num_step": num_step,
+            "hard_count_epoch0": hard_count_epoch0,
+            "hard_count_prev_epoch": hard_count_prev_epoch,
             "recorder_state": recorder.export_state(),
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,

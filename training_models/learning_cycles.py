@@ -203,7 +203,7 @@ class MetricsRecorder:
 
     def log_epoch(self, epoch, learning_rate, train_loss, train_accuracy, val_loss,
                   val_accuracy, samples_used, samples_total, time_seconds, threshold=None,
-                  phase=None, gradient_confusion=None):
+                  phase=None, gradient_confusion=None, hard_fraction=None):
         loss_arr = np.array(self._epoch_loss_buffer) if self._epoch_loss_buffer else np.array([np.nan])
         conf_arr = np.array(self._epoch_conf_buffer) if self._epoch_conf_buffer else np.array([np.nan])
 
@@ -218,6 +218,7 @@ class MetricsRecorder:
             "epoch_fraction": (epoch + 1) / self.total_epochs,
             "threshold": threshold,
             "gradient_confusion": gradient_confusion,
+            "hard_fraction": hard_fraction,
             "learning_rate": learning_rate,
             "train_loss": train_loss,
             "val_loss": val_loss,
