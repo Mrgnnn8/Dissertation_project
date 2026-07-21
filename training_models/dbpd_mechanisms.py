@@ -694,8 +694,12 @@ def train_soft_dbpd(model_name, model, train_loader, test_loader, device, epochs
         time_per_epoch = checkpoint["time_per_epoch"]
         samples_used_per_epoch = checkpoint["samples_used_per_epoch"]
         num_step = checkpoint["num_step"]
-        hard_count_epoch0 = checkpoint["hard_count_epoch0"]
-        hard_count_prev_epoch = checkpoint["hard_count_prev_epoch"]
+        # .get() (not ["..."]): a checkpoint written by a pre-decay version
+        # of this function won't have these keys - falls back to None,
+        # which just bootstraps hard_fraction at 1.0 again on resume rather
+        # than crashing on a stale checkpoint from before this feature existed.
+        hard_count_epoch0 = checkpoint.get("hard_count_epoch0")
+        hard_count_prev_epoch = checkpoint.get("hard_count_prev_epoch")
         torch.set_rng_state(checkpoint["torch_rng_state"])
         if torch.cuda.is_available() and checkpoint.get("cuda_rng_state") is not None:
             torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
